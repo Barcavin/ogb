@@ -26,6 +26,7 @@ class GCN(torch.nn.Module):
     def reset_parameters(self):
         for conv in self.convs:
             conv.reset_parameters()
+        torch.nn.init.xavier_uniform_(self.emb.weight)
 
     def forward(self, x, adj_t):
         x = self.emb.weight
@@ -46,6 +47,7 @@ class SAGE(torch.nn.Module):
     def reset_parameters(self):
         for conv in self.convs:
             conv.reset_parameters()
+        torch.nn.init.xavier_uniform_(self.emb.weight)
 
     def forward(self, x, adj_t):
         x = self.emb.weight
