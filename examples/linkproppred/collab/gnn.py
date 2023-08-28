@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader
 from torch_sparse import SparseTensor
 import torch_geometric.transforms as T
 from torch_geometric.nn import GCNConv, SAGEConv
+from torch_geometric.utils import to_undirected
 
 from ogb.linkproppred import PygLinkPropPredDataset, Evaluator
 
@@ -15,53 +16,40 @@ from logger import Logger
 
 class GCN(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, num_layers,
-                 dropout):
+                 dropout, emb):
         super(GCN, self).__init__()
 
         self.convs = torch.nn.ModuleList()
         self.convs.append(GCNConv(in_channels, hidden_channels, cached=True))
-        for _ in range(num_layers - 2):
-            self.convs.append(
-                GCNConv(hidden_channels, hidden_channels, cached=True))
-        self.convs.append(GCNConv(hidden_channels, out_channels, cached=True))
-
-        self.dropout = dropout
+        self.emb = emb
 
     def reset_parameters(self):
         for conv in self.convs:
             conv.reset_parameters()
 
     def forward(self, x, adj_t):
-        for conv in self.convs[:-1]:
-            x = conv(x, adj_t)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.emb.weight
+        x = F.dropout(x, p=0.3, training=self.training)
         x = self.convs[-1](x, adj_t)
         return x
 
 
 class SAGE(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, num_layers,
-                 dropout):
+                 dropout, emb):
         super(SAGE, self).__init__()
 
         self.convs = torch.nn.ModuleList()
         self.convs.append(SAGEConv(in_channels, hidden_channels))
-        for _ in range(num_layers - 2):
-            self.convs.append(SAGEConv(hidden_channels, hidden_channels))
-        self.convs.append(SAGEConv(hidden_channels, out_channels))
-
-        self.dropout = dropout
+        self.emb = emb
 
     def reset_parameters(self):
         for conv in self.convs:
             conv.reset_parameters()
 
     def forward(self, x, adj_t):
-        for conv in self.convs[:-1]:
-            x = conv(x, adj_t)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.emb.weight
+        x = F.dropout(x, p=0.3, training=self.training)
         x = self.convs[-1](x, adj_t)
         return x
 
@@ -72,11 +60,6 @@ class LinkPredictor(torch.nn.Module):
         super(LinkPredictor, self).__init__()
 
         self.lins = torch.nn.ModuleList()
-        self.lins.append(torch.nn.Linear(in_channels, hidden_channels))
-        for _ in range(num_layers - 2):
-            self.lins.append(torch.nn.Linear(hidden_channels, hidden_channels))
-        self.lins.append(torch.nn.Linear(hidden_channels, out_channels))
-
         self.dropout = dropout
 
     def reset_parameters(self):
@@ -85,11 +68,8 @@ class LinkPredictor(torch.nn.Module):
 
     def forward(self, x_i, x_j):
         x = x_i * x_j
-        for lin in self.lins[:-1]:
-            x = lin(x)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-        x = self.lins[-1](x)
+        # inner product
+        x = x.sum(dim=-1)
         return torch.sigmoid(x)
 
 
@@ -104,7 +84,7 @@ def train(model, predictor, data, split_edge, optimizer, batch_size):
                            shuffle=True):
         optimizer.zero_grad()
 
-        h = model(data.x, data.adj_t)
+        h = model(data.x, data.full_adj_t)
 
         edge = pos_train_edge[perm].t()
 
@@ -137,7 +117,7 @@ def test(model, predictor, data, split_edge, evaluator, batch_size):
     model.eval()
     predictor.eval()
 
-    h = model(data.x, data.adj_t)
+    h = model(data.x, data.full_adj_t)
 
     pos_train_edge = split_edge['train']['edge'].to(h.device)
     pos_valid_edge = split_edge['valid']['edge'].to(h.device)
@@ -198,13 +178,36 @@ def test(model, predictor, data, split_edge, evaluator, batch_size):
     return results
 
 
+# adopted from "https://github.com/melifluos/subgraph-sketching/tree/main"
+def filter_by_year(data, split_edge, year):
+    """
+    remove edges before year from data and split edge
+    @param data: pyg Data, pyg SplitEdge
+    @param split_edges:
+    @param year: int first year to use
+    @return: pyg Data, pyg SplitEdge
+    """
+    selected_year_index = torch.reshape(
+        (split_edge['train']['year'] >= year).nonzero(as_tuple=False), (-1,))
+    split_edge['train']['edge'] = split_edge['train']['edge'][selected_year_index]
+    split_edge['train']['weight'] = split_edge['train']['weight'][selected_year_index]
+    split_edge['train']['year'] = split_edge['train']['year'][selected_year_index]
+    train_edge_index = split_edge['train']['edge'].t()
+    # create adjacency matrix
+    new_edges = to_undirected(train_edge_index, split_edge['train']['weight'], reduce='add')
+    new_edge_index, new_edge_weight = new_edges[0], new_edges[1]
+    data.edge_index = new_edge_index
+    data.edge_weight = new_edge_weight.unsqueeze(-1)
+    return data, split_edge
+
+
 def main():
     parser = argparse.ArgumentParser(description='OGBL-COLLAB (GNN)')
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--log_steps', type=int, default=1)
     parser.add_argument('--use_sage', action='store_true')
     parser.add_argument('--use_valedges_as_input', action='store_true')
-    parser.add_argument('--num_layers', type=int, default=3)
+    parser.add_argument('--num_layers', type=int, default=1)
     parser.add_argument('--hidden_channels', type=int, default=256)
     parser.add_argument('--dropout', type=float, default=0.0)
     parser.add_argument('--batch_size', type=int, default=64 * 1024)
@@ -226,8 +229,15 @@ def main():
 
     split_edge = dataset.get_edge_split()
 
+    # only keep training edges after year 2010
+    year = 2010
+    data, split_edge = filter_by_year(data, split_edge, year)
+
     # Use training + validation edges for inference on test set.
     if args.use_valedges_as_input:
+        # dump validation edges into training
+        split_edge["train"]["edge"] = torch.cat([split_edge["train"]["edge"], split_edge['valid']['edge']], dim=0)
+
         val_edge_index = split_edge['valid']['edge'].t()
         full_edge_index = torch.cat([edge_index, val_edge_index], dim=-1)
         data.full_adj_t = SparseTensor.from_edge_index(full_edge_index).t()
@@ -236,15 +246,17 @@ def main():
         data.full_adj_t = data.adj_t
 
     data = data.to(device)
+    num_features = args.hidden_channels
+    emb = torch.nn.Embedding(data.num_nodes, num_features).to(device)
 
     if args.use_sage:
-        model = SAGE(data.num_features, args.hidden_channels,
+        model = SAGE(num_features, args.hidden_channels,
                      args.hidden_channels, args.num_layers,
-                     args.dropout).to(device)
+                     args.dropout, emb).to(device)
     else:
-        model = GCN(data.num_features, args.hidden_channels,
+        model = GCN(num_features, args.hidden_channels,
                     args.hidden_channels, args.num_layers,
-                    args.dropout).to(device)
+                    args.dropout, emb).to(device)
 
     predictor = LinkPredictor(args.hidden_channels, args.hidden_channels, 1,
                               args.num_layers, args.dropout).to(device)
